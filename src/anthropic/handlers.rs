@@ -168,7 +168,10 @@ impl UsageSource {
     }
 
     /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
-    pub fn resolve(has_provider_usage: bool, cache_usage: &super::cache_metering::CacheUsage) -> Self {
+    pub fn resolve(
+        has_provider_usage: bool,
+        cache_usage: &super::cache_metering::CacheUsage,
+    ) -> Self {
         if has_provider_usage {
             Self::Provider
         } else if cache_usage.cache_covered_est > 0 {
@@ -807,10 +810,9 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidMessageSequence(reason) => (
-                    "invalid_request_error",
-                    format!("消息序列无效: {}", reason),
-                ),
+                ConversionError::InvalidMessageSequence(reason) => {
+                    ("invalid_request_error", format!("消息序列无效: {}", reason))
+                }
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -1004,6 +1006,37 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+fn has_content_events(events: &[SseEvent]) -> bool {
+    events.iter().any(|event| {
+        event.event == "content_block_delta"
+            || (event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use")
+            || (event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "redacted_thinking")
+    })
+}
+
+/// An upstream stream with neither content nor metering must not look like a
+/// completed assistant turn. Initial message/text block events do not count.
+fn finish_upstream_stream(ctx: &mut StreamContext, saw_content: bool) -> (Vec<SseEvent>, bool) {
+    let final_events = ctx.generate_final_events();
+    if ctx.upstream_error_message().is_none()
+        && ctx.tool_json_error_message().is_none()
+        && ctx.metering.is_none()
+        && !saw_content
+        && !has_content_events(&final_events)
+    {
+        return (
+            ctx.generate_error_events(
+                "overloaded_error",
+                "Upstream response ended without content or metering",
+            ),
+            true,
+        );
+    }
+    (final_events, false)
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -1025,8 +1058,8 @@ fn create_sse_stream(
     let settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut settlement, mut sent_bytes)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64, false),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut settlement, mut sent_bytes, mut saw_content)| async move {
             if finished {
                 return None;
             }
@@ -1048,9 +1081,9 @@ fn create_sse_stream(
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                                        match Event::from_frame(frame) {
+                                            Ok(event) => events.extend(ctx.process_kiro_event(&event)),
+                                            Err(e) => tracing::warn!("解析上游事件失败: {}", e),
                                         }
                                     }
                                     Err(e) => {
@@ -1060,13 +1093,14 @@ fn create_sse_stream(
                             }
 
                             // 转换为 SSE 字节流
+                            saw_content |= has_content_events(&events);
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
                             settlement.update(&ctx, sent_bytes);
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, saw_content)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -1089,14 +1123,18 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, saw_content)))
                         }
                         None => {
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
-                            let final_events = ctx.generate_final_events();
+                            let (final_events, empty_stream) = finish_upstream_stream(&mut ctx, saw_content);
                             settlement.update(&ctx, sent_bytes);
-                            if let Some(message) = ctx.tool_json_error_message() {
+                            if empty_stream {
+                                settlement.finish("error", "error", Some(outcome::TRANSIENT), Some("Upstream response ended without content or metering"), None);
+                            } else if let Some(message) = ctx.upstream_error_message() {
+                                settlement.finish("error", "error", Some(outcome::TRANSIENT), Some(message), None);
+                            } else if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
                                 settlement.finish(
@@ -1113,7 +1151,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, saw_content)))
                         }
                     }
                 }
@@ -1121,7 +1159,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, saw_content)))
                 }
             }
         },
@@ -1858,10 +1896,9 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidMessageSequence(reason) => (
-                    "invalid_request_error",
-                    format!("消息序列无效: {}", reason),
-                ),
+                ConversionError::InvalidMessageSequence(reason) => {
+                    ("invalid_request_error", format!("消息序列无效: {}", reason))
+                }
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -2189,6 +2226,47 @@ mod tests {
     use crate::model::config::ToolCompatibilityMode;
 
     #[test]
+    fn empty_upstream_stream_ends_with_retryable_error() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            Default::default(),
+            Default::default(),
+        );
+        ctx.generate_initial_events();
+        let (events, empty) = finish_upstream_stream(&mut ctx, false);
+        assert!(empty);
+        assert!(events.iter().any(
+            |event| event.event == "error" && event.data["error"]["type"] == "overloaded_error"
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event == "message_delta" || event.event == "message_stop")
+        );
+    }
+
+    #[test]
+    fn metered_stream_can_finish_without_visible_content() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            Default::default(),
+            Default::default(),
+        );
+        ctx.generate_initial_events();
+        ctx.metering = Some(
+            serde_json::from_str(r#"{"usage":0.0,"unit":"credit","unitPlural":"credits"}"#)
+                .unwrap(),
+        );
+        let (events, empty) = finish_upstream_stream(&mut ctx, false);
+        assert!(!empty);
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
     fn dropped_stream_settles_latest_usage_exactly_once() {
         let aggregator = std::sync::Arc::new(crate::admin::usage_stats::UsageAggregator::new());
         let state = AppState::new(false, ToolCompatibilityMode::Raw).with_usage(
@@ -2455,10 +2533,12 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Context window is full"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Context window is full")
+        );
     }
 
     #[tokio::test]

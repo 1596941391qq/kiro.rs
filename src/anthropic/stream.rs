@@ -1443,6 +1443,8 @@ pub struct StreamContext {
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
     /// 上层据此把本次请求记为 error 而非 success。
     tool_json_error: Option<ToolJsonAccumulatorError>,
+    /// 上游在事件流中报告的错误；收尾时禁止发送正常的 message_stop。
+    upstream_error: Option<String>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
 }
@@ -1478,6 +1480,10 @@ impl StreamContext {
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.tool_json_error.as_ref().map(|err| err.message())
+    }
+
+    pub fn upstream_error_message(&self) -> Option<&str> {
+        self.upstream_error.as_deref()
     }
 
     /// 创建 StreamContext
@@ -1518,6 +1524,7 @@ impl StreamContext {
             repeat_guard_tripped: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
+            upstream_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
         }
     }
@@ -1642,6 +1649,7 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                self.upstream_error = Some(format!("{error_code}: {error_message}"));
                 Vec::new()
             }
             Event::Exception {
@@ -1651,6 +1659,8 @@ impl StreamContext {
                 // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                } else {
+                    self.upstream_error = Some(format!("{exception_type}: {message}"));
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
@@ -2442,6 +2452,9 @@ impl StreamContext {
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        if let Some(message) = self.upstream_error.clone() {
+            return self.generate_error_events("upstream_error", &message);
+        }
         let mut events = Vec::new();
 
         // 收尾：flush <tool_use> XML 过滤器的残留（截断的未闭合块会被丢弃），
@@ -2862,6 +2875,44 @@ mod tests {
                 .iter()
                 .all(|event| event.event != "message_delta" && event.event != "message_stop")
         );
+    }
+
+    #[test]
+    fn upstream_error_frame_cannot_end_as_success() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Error {
+            error_code: "UpstreamFailure".to_string(),
+            error_message: "failed".to_string(),
+        });
+        let events = ctx.generate_final_events();
+        assert_eq!(events.last().unwrap().event, "error");
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn upstream_exception_frame_cannot_end_as_success() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Exception {
+            exception_type: "UpstreamFailure".to_string(),
+            message: "failed".to_string(),
+        });
+        let events = ctx.generate_final_events();
+        assert_eq!(events.last().unwrap().event, "error");
+        assert!(!events.iter().any(|event| event.event == "message_stop"));
     }
 
     #[test]
